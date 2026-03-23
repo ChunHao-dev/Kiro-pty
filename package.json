@@ -1,0 +1,65 @@
+{
+  "publisher": "chchen",
+  "name": "kiro-pty",
+  "displayName": "Kiro PTY",
+  "description": "Kiro CLI wrapper with pseudoterminal for full input control",
+  "version": "0.0.1",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "kiro-pty.start",
+        "title": "Kiro PTY: Start Chat"
+      },
+      {
+        "command": "kiro-pty.atFile",
+        "title": "Kiro PTY: Reference File"
+      },
+      {
+        "command": "kiro-pty.sendSelection",
+        "title": "Send to Kiro-CLI"
+      }
+    ],
+    "menus": {
+      "editor/context": [
+        {
+          "command": "kiro-pty.sendSelection",
+          "when": "editorHasSelection && kiro-pty.active",
+          "group": "9_kiro"
+        }
+      ]
+    },
+    "keybindings": [
+      {
+        "command": "kiro-pty.paste",
+        "key": "cmd+v",
+        "when": "terminalFocus && kiro-pty.active"
+      },
+      {
+        "command": "kiro-pty.atFile",
+        "key": "cmd+shift+a",
+        "when": "terminalFocus && kiro-pty.active"
+      }
+    ]
+  },
+  "scripts": {
+    "compile": "tsc"
+  },
+  "devDependencies": {
+    "@types/node": "^25.5.0",
+    "@types/vscode": "^1.85.0",
+    "typescript": "^5.0.0"
+  },
+  "dependencies": {
+    "node-pty": "^1.1.0"
+  }
+}
