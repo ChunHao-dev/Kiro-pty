@@ -65,7 +65,10 @@ interface KiroSession {
   acResults: string[];
   acSelected: number;
   acScrollOffset: number;
+  acLines: number;
   lastCharSent: string;
+  termRows: number;
+  termCols: number;
 }
 
 const sessions = new Map<vscode.Terminal, KiroSession>();
@@ -132,9 +135,17 @@ function acRender(s: KiroSession) {
   if (s.acSelected >= s.acScrollOffset + MAX_VISIBLE) s.acScrollOffset = s.acSelected - MAX_VISIBLE + 1;
 
   const visible = s.acResults.slice(s.acScrollOffset, s.acScrollOffset + MAX_VISIBLE);
-  let out = "\x1b[2J\x1b[H";
-  out += "\x1b[1m  @ File Reference\x1b[0m\r\n";
-  out += `\x1b[38;5;244m  Search: \x1b[0m${s.acQuery}\x1b[38;5;244m (↑↓ select, Enter confirm, Esc cancel)\x1b[0m\r\n\r\n`;
+
+  let out = "";
+  // On re-render, move cursor up to start of overlay and clear
+  if (s.acLines > 0) {
+    for (let i = 0; i < s.acLines; i++) out += "\x1b[A\x1b[2K";
+  } else {
+    // First render: newline to separate from prompt
+    out += "\r\n";
+  }
+
+  out += `\x1b[38;5;244m  @${s.acQuery}\x1b[0m (↑↓ Enter Esc)\r\n`;
 
   if (visible.length === 0) {
     out += "\x1b[38;5;244m  (no matches)\x1b[0m\r\n";
@@ -149,6 +160,14 @@ function acRender(s: KiroSession) {
     const rem = s.acResults.length - s.acScrollOffset - visible.length;
     if (rem > 0) out += `\x1b[38;5;244m  ↓ ${rem} more\x1b[0m\r\n`;
   }
+
+  // Count only the overlay lines (not the initial \r\n)
+  let lines = 1 + (visible.length || 1); // search line + results
+  if (s.acScrollOffset > 0) lines++;
+  const rem = s.acResults.length - s.acScrollOffset - visible.length;
+  if (rem > 0) lines++;
+  s.acLines = lines;
+
   s.writeEmitter.fire(out);
 }
 
@@ -157,13 +176,27 @@ function acEnter(s: KiroSession) {
   s.acQuery = "";
   s.acSelected = 0;
   s.acScrollOffset = 0;
-  s.writeEmitter.fire("\x1b[?1049h\x1b[?25l\x1b[0m");
+  s.acLines = 0;
+  s.writeEmitter.fire("\x1b[?25l"); // hide cursor
   acRender(s);
+}
+
+function acClear(s: KiroSession) {
+  // Move up to start of overlay + initial newline, clear each line
+  let out = "";
+  for (let i = 0; i < s.acLines + 1; i++) out += "\x1b[A\x1b[2K";
+  out += "\x1b[?25h"; // show cursor
+  s.writeEmitter.fire(out);
+  // Resize trick to force kiro-cli redraw
+  const cols = s.termCols || 120;
+  const rows = s.termRows || 30;
+  s.pty.resize(cols, rows - 1);
+  setTimeout(() => s.pty.resize(cols, rows), 50);
 }
 
 function acExit(s: KiroSession) {
   s.acActive = false;
-  s.writeEmitter.fire("\x1b[?25h\x1b[?1049l");
+  acClear(s);
 }
 
 function acConfirm(s: KiroSession) {
@@ -234,13 +267,13 @@ function startKiro() {
     onDidWrite: we.event,
     onDidClose: closeEmitter.event,
     open(dim) {
-      if (dim) pty.resize(dim.columns, dim.rows);
+      if (dim) { session.termRows = dim.rows; session.termCols = dim.columns; pty.resize(dim.columns, dim.rows); }
     },
     close() { pty.kill(); },
     handleInput(data: string) {
       if (data.includes("activate") && data.includes(".venv")) return;
       if (acHandleInput(session, data)) return;
-      if (data === "@" && (session.lastCharSent === "" || session.lastCharSent === " " || session.lastCharSent === "\r")) {
+      if (data === "@" && !(session.lastCharSent >= "!" && session.lastCharSent <= "~")) {
         acEnter(session);
         return;
       }
@@ -248,7 +281,7 @@ function startKiro() {
       if (data === "\r") session.lastCharSent = "";
       else if (data.length === 1) session.lastCharSent = data;
     },
-    setDimensions(dim) { pty.resize(dim.columns, dim.rows); },
+    setDimensions(dim) { session.termRows = dim.rows; session.termCols = dim.columns; pty.resize(dim.columns, dim.rows); },
   };
 
   sessionCounter++;
@@ -257,7 +290,8 @@ function startKiro() {
 
   session = {
     pty, terminal, writeEmitter: we,
-    acActive: false, acQuery: "", acResults: [], acSelected: 0, acScrollOffset: 0, lastCharSent: "",
+    acActive: false, acQuery: "", acResults: [], acSelected: 0, acScrollOffset: 0, acLines: 0,
+    lastCharSent: "", termRows: 30, termCols: 120,
   };
   sessions.set(terminal, session);
   terminal.show();
