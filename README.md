@@ -1,5 +1,9 @@
 # Kiro PTY
 
+<p align="center">
+  <img src="banner.png" width="256" />
+</p>
+
 Enhanced terminal wrapper for [kiro-cli](https://kiro.dev) using a pseudoterminal (node-pty) for full input control.
 
 ## Features
