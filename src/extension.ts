@@ -88,7 +88,7 @@ interface KiroSession {
   acSelected: number;
   acScrollOffset: number;
   acLines: number;
-  lastCharSent: string;
+  inputBuffer: string;
   termRows: number;
   termCols: number;
 }
@@ -203,37 +203,43 @@ function acEnter(s: KiroSession) {
   acRender(s);
 }
 
-function acClear(s: KiroSession) {
-  // Move up to start of overlay + initial newline, clear each line
+function acClear(s: KiroSession): Promise<void> {
   let out = "";
   for (let i = 0; i < s.acLines + 1; i++) out += "\x1b[A\x1b[2K";
-  out += "\x1b[?25h"; // show cursor
+  out += "\x1b[?25h";
   s.writeEmitter.fire(out);
-  // Resize trick to force kiro-cli redraw
+  // Resize trick to force kiro-cli to redraw prompt
   const cols = s.termCols || 120;
   const rows = s.termRows || 30;
   s.pty.resize(cols, rows - 1);
-  setTimeout(() => s.pty.resize(cols, rows), 50);
+  return new Promise(r => setTimeout(() => {
+    s.pty.resize(cols, rows);
+    // Wait for kiro-cli to finish redrawing after resize
+    setTimeout(r, 100);
+  }, 50));
 }
 
-function acExit(s: KiroSession) {
+async function acExit(s: KiroSession) {
   s.acActive = false;
-  acClear(s);
+  await acClear(s);
 }
 
-function acConfirm(s: KiroSession) {
+async function acConfirm(s: KiroSession) {
   const picked = s.acResults[s.acSelected];
-  acExit(s);
+  await acExit(s);
   if (picked) {
     const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
-    s.pty.write(root ? path.join(root, picked) : picked);
+    const text = "@" + (root ? path.join(root, picked) : picked);
+    s.pty.write(text);
+    s.inputBuffer += text;
   }
 }
 
-function acCancel(s: KiroSession) {
+async function acCancel(s: KiroSession) {
   const text = "@" + s.acQuery;
-  acExit(s);
+  await acExit(s);
   s.pty.write(text);
+  s.inputBuffer += text;
 }
 
 function acHandleInput(s: KiroSession, data: string): boolean {
@@ -295,13 +301,15 @@ function startKiro() {
     handleInput(data: string) {
       if (data.includes("activate") && data.includes(".venv")) return;
       if (acHandleInput(session, data)) return;
-      if (data === "@" && !(session.lastCharSent >= "!" && session.lastCharSent <= "~")) {
+      const prev = session.inputBuffer.length > 0 ? session.inputBuffer[session.inputBuffer.length - 1] : "";
+      if (data === "@" && (prev === "" || prev === " ")) {
         acEnter(session);
         return;
       }
       pty.write(data);
-      if (data === "\r") session.lastCharSent = "";
-      else if (data.length === 1) session.lastCharSent = data;
+      if (data === "\r") session.inputBuffer = "";
+      else if (data === "\x7f") session.inputBuffer = session.inputBuffer.slice(0, -1);
+      else session.inputBuffer += data;
     },
     setDimensions(dim) { session.termRows = dim.rows; session.termCols = dim.columns; pty.resize(dim.columns, dim.rows); },
   };
@@ -313,7 +321,7 @@ function startKiro() {
   session = {
     pty, terminal, writeEmitter: we,
     acActive: false, acQuery: "", acResults: [], acSelected: 0, acScrollOffset: 0, acLines: 0,
-    lastCharSent: "", termRows: 30, termCols: 120,
+    inputBuffer: "", termRows: 30, termCols: 120,
   };
   sessions.set(terminal, session);
   terminal.show();
@@ -336,13 +344,22 @@ export function activate(context: vscode.ExtensionContext) {
 
     vscode.commands.registerCommand("kiro-pty.start", startKiro),
 
-    vscode.commands.registerCommand("kiro-pty.paste", () => {
+    vscode.commands.registerCommand("kiro-pty.paste", async () => {
       const s = activeSession();
       if (!s) { vscode.commands.executeCommand("workbench.action.terminal.paste"); return; }
-      const files = clipboardFilePaths();
-      if (files.length > 0) { s.pty.write(files.join(" ")); return; }
-      if (clipboardHasImage()) { const p = saveClipboardImage(); if (p) { s.pty.write(p); return; } }
-      vscode.env.clipboard.readText().then(text => { if (text) s.pty.write(text); });
+      try {
+        const info = execSync(`osascript -e 'clipboard info' 2>/dev/null`, { timeout: 500, encoding: "utf-8" }).trim();
+        if (info.includes("«class furl»")) {
+          const files = clipboardFilePaths();
+          if (files.length > 0) { s.pty.write(files.join(" ")); return; }
+        }
+        if (info.includes("TIFF")) {
+          const p = saveClipboardImage();
+          if (p) { s.pty.write(p); return; }
+        }
+      } catch {}
+      const text = await vscode.env.clipboard.readText();
+      if (text) s.pty.write(text);
     }),
 
     vscode.commands.registerCommand("kiro-pty.atFile", async () => {
