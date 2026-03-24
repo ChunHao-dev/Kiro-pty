@@ -5,10 +5,7 @@ import { existsSync, readdirSync, statSync, chmodSync } from "fs";
 import * as path from "path";
 
 const KIRO_CLI = "/Users/chchen/.local/bin/kiro-cli";
-
-let kiroPty: ptyLib.IPty | undefined;
-let kiroTerminal: vscode.Terminal | undefined;
-let writeEmitter: vscode.EventEmitter<string>;
+const MAX_VISIBLE = 8;
 
 // Fix spawn-helper permissions on first load
 try {
@@ -16,6 +13,70 @@ try {
   if (existsSync(helper)) chmodSync(helper, 0o755);
 } catch {}
 
+// --- File index ---
+let fileIndex: string[] = [];
+
+function buildFileIndex() {
+  const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+  if (!root) return;
+  fileIndex = [];
+  const skip = new Set(["node_modules", "out", "dist", ".git", ".next", "__pycache__", "build"]);
+  function walk(dir: string, prefix: string) {
+    if (fileIndex.length >= 2000) return;
+    for (const name of readdirSync(dir)) {
+      if (name.startsWith(".") || skip.has(name)) continue;
+      const full = path.join(dir, name);
+      const rel = prefix ? `${prefix}/${name}` : name;
+      try {
+        if (statSync(full).isDirectory()) {
+          fileIndex.push(rel + "/");
+          walk(full, rel);
+        } else {
+          fileIndex.push(rel);
+        }
+      } catch {}
+    }
+  }
+  walk(root, "");
+}
+
+function fuzzyMatch(query: string, target: string): boolean {
+  const q = query.toLowerCase();
+  const t = target.toLowerCase();
+  let qi = 0;
+  for (let ti = 0; ti < t.length && qi < q.length; ti++) {
+    if (t[ti] === q[qi]) qi++;
+  }
+  return qi === q.length;
+}
+
+function filterFiles(query: string): string[] {
+  if (!query) return fileIndex.slice(0, 50);
+  return fileIndex.filter(f => fuzzyMatch(query, f)).slice(0, 50);
+}
+
+// --- Per-terminal state ---
+interface KiroSession {
+  pty: ptyLib.IPty;
+  terminal: vscode.Terminal;
+  writeEmitter: vscode.EventEmitter<string>;
+  acActive: boolean;
+  acQuery: string;
+  acResults: string[];
+  acSelected: number;
+  acScrollOffset: number;
+  lastCharSent: string;
+}
+
+const sessions = new Map<vscode.Terminal, KiroSession>();
+let sessionCounter = 0;
+
+function activeSession(): KiroSession | undefined {
+  const t = vscode.window.activeTerminal;
+  return t ? sessions.get(t) : undefined;
+}
+
+// --- Clipboard helpers ---
 function nextImgPath(): string {
   let i = 1;
   while (existsSync(`/tmp/kiro-img${i}.png`)) i++;
@@ -59,150 +120,198 @@ if let img = pb.readObjects(forClasses: [NSImage.self], options: nil)?.first as?
   } catch { return undefined; }
 }
 
-function writeToKiro(text: string) {
-  kiroPty?.write(text);
-}
-
 function updateContext() {
-  vscode.commands.executeCommand("setContext", "kiro-pty.active", !!kiroPty);
+  vscode.commands.executeCommand("setContext", "kiro-pty.active", sessions.size > 0);
 }
 
-async function showFilePicker(): Promise<string | undefined> {
-  const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
-  if (!root) return;
+// --- Autocomplete ---
+function acRender(s: KiroSession) {
+  s.acResults = filterFiles(s.acQuery);
+  s.acSelected = Math.min(s.acSelected, Math.max(0, s.acResults.length - 1));
+  if (s.acSelected < s.acScrollOffset) s.acScrollOffset = s.acSelected;
+  if (s.acSelected >= s.acScrollOffset + MAX_VISIBLE) s.acScrollOffset = s.acSelected - MAX_VISIBLE + 1;
 
-  const items: vscode.QuickPickItem[] = [];
-  function walk(dir: string, prefix: string) {
-    if (items.length >= 1000) return;
-    for (const name of readdirSync(dir)) {
-      if (name.startsWith(".") || name === "node_modules" || name === "out" || name === "dist") continue;
-      const full = path.join(dir, name);
-      const rel = prefix ? `${prefix}/${name}` : name;
-      try {
-        if (statSync(full).isDirectory()) {
-          items.push({ label: `📁 ${rel}`, description: full });
-          walk(full, rel);
-        } else {
-          items.push({ label: rel, description: full });
-        }
-      } catch {}
+  const visible = s.acResults.slice(s.acScrollOffset, s.acScrollOffset + MAX_VISIBLE);
+  let out = "\x1b[2J\x1b[H";
+  out += "\x1b[1m  @ File Reference\x1b[0m\r\n";
+  out += `\x1b[38;5;244m  Search: \x1b[0m${s.acQuery}\x1b[38;5;244m (↑↓ select, Enter confirm, Esc cancel)\x1b[0m\r\n\r\n`;
+
+  if (visible.length === 0) {
+    out += "\x1b[38;5;244m  (no matches)\x1b[0m\r\n";
+  } else {
+    if (s.acScrollOffset > 0) out += `\x1b[38;5;244m  ↑ ${s.acScrollOffset} more\x1b[0m\r\n`;
+    for (let i = 0; i < visible.length; i++) {
+      const gi = s.acScrollOffset + i;
+      out += gi === s.acSelected
+        ? `\x1b[46m\x1b[30m  ▸ ${visible[i]} \x1b[0m\r\n`
+        : `\x1b[38;5;244m    ${visible[i]}\x1b[0m\r\n`;
     }
+    const rem = s.acResults.length - s.acScrollOffset - visible.length;
+    if (rem > 0) out += `\x1b[38;5;244m  ↓ ${rem} more\x1b[0m\r\n`;
   }
-  walk(root, "");
-
-  const picked = await vscode.window.showQuickPick(items, { placeHolder: "Select file to reference..." });
-  return picked?.description;
+  s.writeEmitter.fire(out);
 }
 
+function acEnter(s: KiroSession) {
+  s.acActive = true;
+  s.acQuery = "";
+  s.acSelected = 0;
+  s.acScrollOffset = 0;
+  s.writeEmitter.fire("\x1b[?1049h\x1b[?25l\x1b[0m");
+  acRender(s);
+}
+
+function acExit(s: KiroSession) {
+  s.acActive = false;
+  s.writeEmitter.fire("\x1b[?25h\x1b[?1049l");
+}
+
+function acConfirm(s: KiroSession) {
+  const picked = s.acResults[s.acSelected];
+  acExit(s);
+  if (picked) {
+    const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    s.pty.write(root ? path.join(root, picked) : picked);
+  }
+}
+
+function acCancel(s: KiroSession) {
+  const text = "@" + s.acQuery;
+  acExit(s);
+  s.pty.write(text);
+}
+
+function acHandleInput(s: KiroSession, data: string): boolean {
+  if (!s.acActive) return false;
+  if (data === "\r" || data === "\t") { acConfirm(s); return true; }
+  if (data === "\x1b" || data === "\x03") { acCancel(s); return true; }
+  if (data === "\x1b[A") { s.acSelected = Math.max(0, s.acSelected - 1); acRender(s); return true; }
+  if (data === "\x1b[B") { s.acSelected = Math.min(Math.max(0, s.acResults.length - 1), s.acSelected + 1); acRender(s); return true; }
+  if (data === "\x7f") {
+    if (s.acQuery.length > 0) { s.acQuery = s.acQuery.slice(0, -1); s.acSelected = 0; s.acScrollOffset = 0; acRender(s); }
+    else acCancel(s);
+    return true;
+  }
+  if (data.length === 1 && data >= " ") { s.acQuery += data; s.acSelected = 0; s.acScrollOffset = 0; acRender(s); return true; }
+  acCancel(s);
+  return false;
+}
+
+// --- Terminal ---
 function startKiro() {
-  writeEmitter = new vscode.EventEmitter<string>();
+  const we = new vscode.EventEmitter<string>();
   const closeEmitter = new vscode.EventEmitter<number>();
   const cwd = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || process.env.HOME || "/";
 
-  kiroPty = ptyLib.spawn(KIRO_CLI, ["chat"], {
-    name: "xterm-256color",
-    cols: 120,
-    rows: 30,
-    cwd,
-    env: { ...process.env } as { [key: string]: string },
+  buildFileIndex();
+
+  const env = { ...process.env } as { [key: string]: string };
+  for (const k of Object.keys(env)) {
+    if (k.startsWith("VSCODE_") || k === "PYTHONSTARTUP") delete env[k];
+  }
+  const venvDir = path.join(cwd, ".venv");
+  if (existsSync(path.join(venvDir, "bin", "activate"))) {
+    env.VIRTUAL_ENV = venvDir;
+    env.PATH = path.join(venvDir, "bin") + ":" + (env.PATH || "");
+  }
+
+  const pty = ptyLib.spawn(KIRO_CLI, ["chat"], {
+    name: "xterm-256color", cols: 120, rows: 30, cwd, env,
   });
 
-  kiroPty.onData((data: string) => {
-    writeEmitter.fire(data);
-  });
+  // Session will be set after terminal is created
+  let session: KiroSession;
 
-  kiroPty.onExit(({ exitCode }) => {
-    closeEmitter.fire(exitCode);
-    kiroPty = undefined;
-    kiroTerminal = undefined;
+  pty.onData((data: string) => { we.fire(data); });
+
+  pty.onExit(() => {
+    closeEmitter.fire(0);
+    sessions.delete(session.terminal);
     updateContext();
   });
 
   const pseudoTerminal: vscode.Pseudoterminal = {
-    onDidWrite: writeEmitter.event,
+    onDidWrite: we.event,
     onDidClose: closeEmitter.event,
     open(dim) {
-      if (dim && kiroPty) kiroPty.resize(dim.columns, dim.rows);
+      if (dim) pty.resize(dim.columns, dim.rows);
     },
-    close() {
-      kiroPty?.kill();
-      kiroPty = undefined;
-    },
+    close() { pty.kill(); },
     handleInput(data: string) {
-      if (data === "@") {
-        // Send @ to kiro-cli first
-        writeToKiro("@");
-        // Show file picker
-        showFilePicker().then(filePath => {
-          if (filePath) {
-            // Delete the @ then send path
-            writeToKiro("\x7f");
-            writeToKiro(filePath);
-          }
-        });
+      if (data.includes("activate") && data.includes(".venv")) return;
+      if (acHandleInput(session, data)) return;
+      if (data === "@" && (session.lastCharSent === "" || session.lastCharSent === " " || session.lastCharSent === "\r")) {
+        acEnter(session);
         return;
       }
-      writeToKiro(data);
+      pty.write(data);
+      if (data === "\r") session.lastCharSent = "";
+      else if (data.length === 1) session.lastCharSent = data;
     },
-    setDimensions(dim) {
-      kiroPty?.resize(dim.columns, dim.rows);
-    },
+    setDimensions(dim) { pty.resize(dim.columns, dim.rows); },
   };
 
-  kiroTerminal = vscode.window.createTerminal({ name: "Kiro Chat", pty: pseudoTerminal });
-  kiroTerminal.show();
+  sessionCounter++;
+  const name = sessionCounter === 1 ? "Kiro Chat" : `Kiro Chat ${sessionCounter}`;
+  const terminal = vscode.window.createTerminal({ name, pty: pseudoTerminal });
+
+  session = {
+    pty, terminal, writeEmitter: we,
+    acActive: false, acQuery: "", acResults: [], acSelected: 0, acScrollOffset: 0, lastCharSent: "",
+  };
+  sessions.set(terminal, session);
+  terminal.show();
   updateContext();
 }
 
 export function activate(context: vscode.ExtensionContext) {
   context.subscriptions.push(
     vscode.window.onDidCloseTerminal((t) => {
-      if (t === kiroTerminal) {
-        kiroPty?.kill();
-        kiroPty = undefined;
-        kiroTerminal = undefined;
-        updateContext();
-      }
+      const s = sessions.get(t);
+      if (s) { s.pty.kill(); sessions.delete(t); updateContext(); }
     }),
 
-    vscode.commands.registerCommand("kiro-pty.start", () => {
-      if (kiroTerminal) { kiroTerminal.show(); return; }
-      startKiro();
-    }),
+    vscode.commands.registerCommand("kiro-pty.start", startKiro),
 
     vscode.commands.registerCommand("kiro-pty.paste", () => {
-      if (!kiroPty) {
-        vscode.commands.executeCommand("workbench.action.terminal.paste");
-        return;
-      }
+      const s = activeSession();
+      if (!s) { vscode.commands.executeCommand("workbench.action.terminal.paste"); return; }
       const files = clipboardFilePaths();
-      if (files.length > 0) { writeToKiro(files.join(" ")); return; }
-      if (clipboardHasImage()) {
-        const p = saveClipboardImage();
-        if (p) { writeToKiro(p); return; }
-      }
-      vscode.env.clipboard.readText().then(text => { if (text) writeToKiro(text); });
+      if (files.length > 0) { s.pty.write(files.join(" ")); return; }
+      if (clipboardHasImage()) { const p = saveClipboardImage(); if (p) { s.pty.write(p); return; } }
+      vscode.env.clipboard.readText().then(text => { if (text) s.pty.write(text); });
     }),
 
     vscode.commands.registerCommand("kiro-pty.atFile", async () => {
-      if (!kiroPty) return;
-      const filePath = await showFilePicker();
-      if (filePath) writeToKiro(filePath);
+      const s = activeSession();
+      if (!s) return;
+      const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+      if (!root) return;
+      const items: vscode.QuickPickItem[] = fileIndex.map(f => ({
+        label: f.endsWith("/") ? `📁 ${f}` : f,
+        description: path.join(root, f),
+      }));
+      const picked = await vscode.window.showQuickPick(items, { placeHolder: "Select file to reference..." });
+      if (picked) s.pty.write(picked.description!);
     }),
 
     vscode.commands.registerCommand("kiro-pty.sendSelection", () => {
       const editor = vscode.window.activeTextEditor;
-      if (!editor || !kiroPty) return;
+      if (!editor) return;
       const text = editor.document.getText(editor.selection);
       if (!text) return;
-
-      const filePath = editor.document.uri.fsPath;
+      // Find any session to send to — prefer active, fallback to first
+      const s = activeSession() || sessions.values().next().value;
+      if (!s) return;
+      const filePath = vscode.workspace.asRelativePath(editor.document.uri);
       const startLine = editor.selection.start.line + 1;
       const endLine = editor.selection.end.line + 1;
-      writeToKiro(`${filePath}:${startLine}-${endLine}\n\`\`\`\n${text}\n\`\`\``);
-      kiroTerminal?.show();
+      s.pty.write(`${filePath}:${startLine}-${endLine}`);
+      s.terminal.show();
     }),
   );
 }
 
-export function deactivate() { kiroPty?.kill(); }
+export function deactivate() {
+  for (const s of sessions.values()) s.pty.kill();
+}

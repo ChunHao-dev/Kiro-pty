@@ -34,7 +34,7 @@
         {
           "command": "kiro-pty.sendSelection",
           "when": "editorHasSelection && kiro-pty.active",
-          "group": "9_kiro"
+          "group": "0_kiro"
         }
       ]
     },
