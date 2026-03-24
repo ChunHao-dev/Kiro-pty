@@ -322,6 +322,13 @@ function startKiro() {
 
 export function activate(context: vscode.ExtensionContext) {
   context.subscriptions.push(
+    vscode.window.registerTerminalProfileProvider("kiro-pty.terminal-profile", {
+      provideTerminalProfile: () => {
+        startKiro();
+        return undefined as any;
+      },
+    }),
+
     vscode.window.onDidCloseTerminal((t) => {
       const s = sessions.get(t);
       if (s) { s.pty.kill(); sessions.delete(t); updateContext(); }

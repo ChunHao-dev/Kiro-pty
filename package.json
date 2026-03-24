@@ -1,8 +1,8 @@
 {
-  "publisher": "chchen",
+  "publisher": "CHChen",
   "name": "kiro-pty",
   "displayName": "Kiro PTY",
-  "description": "Kiro CLI wrapper with pseudoterminal for full input control",
+  "description": "Kiro CLI wrapper with pseudoterminal — paste images/files, @ file picker, send code from editor",
   "version": "0.0.1",
   "engines": {
     "vscode": "^1.85.0"
@@ -14,6 +14,7 @@
     "onStartupFinished"
   ],
   "main": "./out/extension.js",
+  "icon": "icon.png",
   "contributes": {
     "commands": [
       {
@@ -49,7 +50,15 @@
         "key": "cmd+shift+a",
         "when": "terminalFocus && kiro-pty.active"
       }
-    ]
+    ],
+    "terminal": {
+      "profiles": [
+        {
+          "id": "kiro-pty.terminal-profile",
+          "title": "Kiro Chat"
+        }
+      ]
+    }
   },
   "scripts": {
     "compile": "tsc"
