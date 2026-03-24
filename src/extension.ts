@@ -50,9 +50,31 @@ function fuzzyMatch(query: string, target: string): boolean {
   return qi === q.length;
 }
 
+function getOpenFiles(): Set<string> {
+  const open = new Set<string>();
+  const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+  if (!root) return open;
+  for (const group of vscode.window.tabGroups.all) {
+    for (const tab of group.tabs) {
+      const uri = (tab.input as any)?.uri as vscode.Uri | undefined;
+      if (uri) {
+        const rel = path.relative(root, uri.fsPath);
+        if (!rel.startsWith("..")) open.add(rel);
+      }
+    }
+  }
+  return open;
+}
+
 function filterFiles(query: string): string[] {
-  if (!query) return fileIndex.slice(0, 50);
-  return fileIndex.filter(f => fuzzyMatch(query, f)).slice(0, 50);
+  const candidates = query ? fileIndex.filter(f => fuzzyMatch(query, f)) : fileIndex;
+  const open = getOpenFiles();
+  const opened: string[] = [];
+  const rest: string[] = [];
+  for (const f of candidates) {
+    (open.has(f) ? opened : rest).push(f);
+  }
+  return [...opened, ...rest].slice(0, 50);
 }
 
 // --- Per-terminal state ---
