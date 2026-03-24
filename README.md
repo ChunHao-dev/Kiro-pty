@@ -8,7 +8,7 @@ Enhanced terminal wrapper for [kiro-cli](https://kiro.dev) using a pseudotermina
 
 ## Why
 
-kiro-cli runs in a terminal — which means no drag-and-drop, no image paste, and no quick way to reference project files. Things that IDE-based AI tools get for free become friction points in a CLI workflow:
+kiro-cli runs in a terminal — which means no image paste and no quick way to reference project files. Things that IDE-based AI tools get for free become friction points in a CLI workflow:
 
 - **Screenshots** — You take a screenshot to show the AI a bug, but the CLI can't receive images. You have to manually save the file, find the path, and type it in.
 - **File/folder paths** — You want to point the AI at a specific file or directory. In Finder you can see it, but getting the full path into the terminal takes multiple steps.
