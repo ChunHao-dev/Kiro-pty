@@ -19,25 +19,13 @@ let fileIndex: string[] = [];
 function buildFileIndex() {
   const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
   if (!root) return;
-  fileIndex = [];
-  const skip = new Set(["node_modules", "out", "dist", ".git", ".next", "__pycache__", "build"]);
-  function walk(dir: string, prefix: string) {
-    if (fileIndex.length >= 2000) return;
-    for (const name of readdirSync(dir)) {
-      if (name.startsWith(".") || skip.has(name)) continue;
-      const full = path.join(dir, name);
-      const rel = prefix ? `${prefix}/${name}` : name;
-      try {
-        if (statSync(full).isDirectory()) {
-          fileIndex.push(rel + "/");
-          walk(full, rel);
-        } else {
-          fileIndex.push(rel);
-        }
-      } catch {}
-    }
+  try {
+    const result = execSync("/opt/homebrew/bin/rg --files", { cwd: root, timeout: 3000, encoding: "utf-8", maxBuffer: 10 * 1024 * 1024 }).trim();
+    fileIndex = result ? result.split("\n") : [];
+  } catch {
+    fileIndex = [];
+    vscode.window.showWarningMessage("Kiro PTY: @ file picker requires ripgrep. Install with `brew install ripgrep`.");
   }
-  walk(root, "");
 }
 
 function fuzzyMatch(query: string, target: string): boolean {
@@ -67,12 +55,13 @@ function getOpenFiles(): Set<string> {
 }
 
 function filterFiles(query: string): string[] {
-  const candidates = query ? fileIndex.filter(f => fuzzyMatch(query, f)) : fileIndex;
   const open = getOpenFiles();
   const opened: string[] = [];
   const rest: string[] = [];
-  for (const f of candidates) {
+  for (const f of fileIndex) {
+    if (query && !fuzzyMatch(query, f)) continue;
     (open.has(f) ? opened : rest).push(f);
+    if (opened.length + rest.length >= 200) break;
   }
   return [...opened, ...rest].slice(0, 50);
 }
@@ -172,12 +161,14 @@ function acRender(s: KiroSession) {
   if (visible.length === 0) {
     out += "\x1b[38;5;244m  (no matches)\x1b[0m\r\n";
   } else {
+    const maxW = (s.termCols || 120) - 6; // 6 = prefix "  ▸ " + margin
     if (s.acScrollOffset > 0) out += `\x1b[38;5;244m  ↑ ${s.acScrollOffset} more\x1b[0m\r\n`;
     for (let i = 0; i < visible.length; i++) {
       const gi = s.acScrollOffset + i;
+      const label = visible[i].length > maxW ? "…" + visible[i].slice(-(maxW - 1)) : visible[i];
       out += gi === s.acSelected
-        ? `\x1b[46m\x1b[30m  ▸ ${visible[i]} \x1b[0m\r\n`
-        : `\x1b[38;5;244m    ${visible[i]}\x1b[0m\r\n`;
+        ? `\x1b[46m\x1b[30m  ▸ ${label} \x1b[0m\r\n`
+        : `\x1b[38;5;244m    ${label}\x1b[0m\r\n`;
     }
     const rem = s.acResults.length - s.acScrollOffset - visible.length;
     if (rem > 0) out += `\x1b[38;5;244m  ↓ ${rem} more\x1b[0m\r\n`;
@@ -248,6 +239,7 @@ function acHandleInput(s: KiroSession, data: string): boolean {
   if (data === "\x1b" || data === "\x03") { acCancel(s); return true; }
   if (data === "\x1b[A") { s.acSelected = Math.max(0, s.acSelected - 1); acRender(s); return true; }
   if (data === "\x1b[B") { s.acSelected = Math.min(Math.max(0, s.acResults.length - 1), s.acSelected + 1); acRender(s); return true; }
+  if (data === "\x1b[C" || data === "\x1b[D") return true;
   if (data === "\x7f") {
     if (s.acQuery.length > 0) { s.acQuery = s.acQuery.slice(0, -1); s.acSelected = 0; s.acScrollOffset = 0; acRender(s); }
     else acCancel(s);
@@ -266,7 +258,17 @@ function startKiro() {
 
   buildFileIndex();
 
-  const env = { ...process.env } as { [key: string]: string };
+  let env: { [key: string]: string };
+  try {
+    const raw = execSync("/bin/zsh -ilc env", { timeout: 5000, encoding: "utf-8" });
+    env = {};
+    for (const line of raw.split("\n")) {
+      const i = line.indexOf("=");
+      if (i > 0) env[line.slice(0, i)] = line.slice(i + 1);
+    }
+  } catch {
+    env = { ...process.env } as { [key: string]: string };
+  }
   for (const k of Object.keys(env)) {
     if (k.startsWith("VSCODE_") || k === "PYTHONSTARTUP") delete env[k];
   }
@@ -275,6 +277,14 @@ function startKiro() {
     env.VIRTUAL_ENV = venvDir;
     env.PATH = path.join(venvDir, "bin") + ":" + (env.PATH || "");
   }
+
+  // Workaround: kiro-cli's execute_bash spawns a clean shell that loses PATH.
+  // Create a wrapper script that re-exports the full PATH before executing.
+  const wrapper = "/tmp/kiro-pty-shell.sh";
+  require("fs").writeFileSync(wrapper,
+    `#!/bin/zsh\nexport PATH="${env.PATH}"\nexec /bin/zsh "$@"\n`,
+    { mode: 0o755 });
+  env.KIRO_CHAT_SHELL = wrapper;
 
   const pty = ptyLib.spawn(KIRO_CLI, ["chat"], {
     name: "xterm-256color", cols: 120, rows: 30, cwd, env,
